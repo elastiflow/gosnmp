@@ -1,6 +1,6 @@
 module github.com/gosnmp/gosnmp/netsnmp
 
-go 1.24.0
+go 1.26.11
 
 require (
 	github.com/google/go-cmp v0.7.0
@@ -9,7 +9,6 @@ require (
 )
 
 require (
-	github.com/golang/mock v1.6.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 )
