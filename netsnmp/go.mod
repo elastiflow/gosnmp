@@ -2,7 +2,7 @@ module github.com/gosnmp/gosnmp/netsnmp
 
 go 1.26.0
 
-toolchain go1.26.11
+toolchain go1.27.4
 
 require (
 	github.com/google/go-cmp v0.7.0
@@ -11,8 +11,8 @@ require (
 )
 
 require (
-	golang.org/x/net v0.48.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )
 
 replace github.com/gosnmp/gosnmp => ../
