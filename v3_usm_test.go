@@ -374,6 +374,29 @@ func TestDecryptPacketInvalidPrivacyParameters(t *testing.T) {
 	}
 }
 
+// TestHMACEmptyPassword verifies that hMAC returns an error rather than an
+// empty key when the password is empty, so key localization fails closed
+// instead of producing a zero-length HMAC key.
+func TestHMACEmptyPassword(t *testing.T) {
+	engineID := authorativeEngineID(t)
+
+	for _, proto := range []SnmpV3AuthProtocol{MD5, SHA, SHA224, SHA256, SHA384, SHA512} {
+		t.Run(proto.String(), func(t *testing.T) {
+			t.Run("empty password", func(t *testing.T) {
+				key, err := hMAC(proto.HashType(), cacheKey(proto, ""), "", engineID)
+				require.ErrorContains(t, err, "password is empty")
+				require.Empty(t, key)
+			})
+
+			t.Run("non-empty password", func(t *testing.T) {
+				key, err := hMAC(proto.HashType(), cacheKey(proto, "authkey1"), "authkey1", engineID)
+				require.NoError(t, err)
+				require.Len(t, key, proto.HashType().Size())
+			})
+		})
+	}
+}
+
 func BenchmarkSingleHash(b *testing.B) {
 	SetPwdCache()
 
@@ -393,4 +416,37 @@ func BenchmarkSingleHash(b *testing.B) {
 	passwordKeyHashMutex.RLock()
 	b.Logf("cache size %d", len(passwordKeyHashCache))
 	passwordKeyHashMutex.RUnlock()
+}
+
+// TestUnmarshalShortAuthParametersNoPanic ensures the USM parameter parser
+// rejects an authenticated message whose msgAuthenticationParameters field is
+// shorter than the configured digest length, instead of slicing past the field
+// (and past the packet) while blanking it. The field is parsed before any
+// authentication check runs, so a shorter value from any remote peer used to
+// panic with a slice bounds error.
+func TestUnmarshalShortAuthParametersNoPanic(t *testing.T) {
+	sp := &UsmSecurityParameters{
+		AuthenticationProtocol: MD5,
+		Logger:                 NewLogger(log.New(io.Discard, "", 0)),
+	}
+
+	// USM SEQUENCE:
+	//   engineID   04 00
+	//   boots      02 01 00
+	//   time       02 01 00
+	//   userName   04 00
+	//   authParams 04 04 00 00 00 00   (4 bytes, MD5 expects 12)
+	//   privParams 04 00
+	packet := []byte{
+		byte(Sequence), 0x0e,
+		byte(OctetString), 0x00,
+		byte(Integer), 0x01, 0x00,
+		byte(Integer), 0x01, 0x00,
+		byte(OctetString), 0x00,
+		byte(OctetString), 0x04, 0x00, 0x00, 0x00, 0x00,
+		byte(OctetString), 0x00,
+	}
+
+	_, err := sp.unmarshal(AuthNoPriv, packet, 0)
+	require.EqualError(t, err, "error parsing SNMPv3 User Security Model: msgAuthenticationParameters length 6 does not match MD5")
 }

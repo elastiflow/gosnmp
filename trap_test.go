@@ -7,6 +7,7 @@
 package gosnmp
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -387,6 +388,37 @@ func TestUnmarshalTrapRejectsDowngrade(t *testing.T) {
 	require.Nil(t, res)
 }
 
+// TestUnmarshalTrapRejectsUnknownSecurityModel checks that a v3 trap cannot
+// skip authentication by claiming a security model other than USM.
+func TestUnmarshalTrapRejectsUnknownSecurityModel(t *testing.T) {
+	const msgFlagsOffset = 21
+	const msgSecurityModelOffset = 24
+	forged := func() []byte {
+		buf := genericV3Trap()
+		require.Equal(t, byte(AuthNoPriv), buf[msgFlagsOffset])
+		require.Equal(t, byte(UserSecurityModel), buf[msgSecurityModelOffset])
+		buf[msgFlagsOffset] = byte(NoAuthNoPriv)
+		buf[msgSecurityModelOffset] = 1
+		return buf
+	}
+
+	for _, useResponse := range []bool{false, true} {
+		gs := newTestGoSNMPv3(AuthNoPriv, secParamsList[0].Copy()) // myuser, MD5
+		res, err := gs.UnmarshalTrap(forged(), useResponse)
+		require.ErrorContains(t, err, "unsupported security model", "useResponseSecurityParameters %v", useResponse)
+		require.Nil(t, res)
+	}
+
+	usmMap := NewSnmpV3SecurityParametersTable(NewLogger(log.New(io.Discard, "", 0)))
+	require.NoError(t, usmMap.Add(secParamsList[0].UserName, secParamsList[0]))
+	gs := newTestGoSNMP()
+	gs.SetTrapSecurityParametersTable(usmMap)
+	gs.Version = Version3
+	res, err := gs.UnmarshalTrap(forged(), true)
+	require.ErrorContains(t, err, "unsupported security model")
+	require.Nil(t, res)
+}
+
 // TestUnmarshalTrapDiscoveryRequestUseResponse checks that the security
 // level check does not reject an engine discovery request when the packet's
 // own msgFlags are trusted.
@@ -506,6 +538,61 @@ func TestUnmarshalTrapNoAuthUserInTable(t *testing.T) {
 	require.Equal(t, uint32(1), res.RequestID)
 }
 
+// TestUnmarshalTrapLocalizedKeyOnlyNewEngineID checks that a user configured
+// with a localized key and no passphrase does not accept a trap from another
+// engine ID signed with an empty key. The key cannot be relocalized without
+// the passphrase, so the trap must be rejected.
+func TestUnmarshalTrapLocalizedKeyOnlyNewEngineID(t *testing.T) {
+	logger := NewLogger(log.New(io.Discard, "", 0))
+	configuredEngineID := "\x80\x00\x1f\x88\x04receiver"
+	secretKey, err := genlocalkey(MD5, "mypassword", configuredEngineID)
+	require.NoError(t, err)
+
+	gs := newTestGoSNMP()
+	gs.Version = Version3
+	gs.SecurityParameters = &UsmSecurityParameters{
+		UserName:               "myuser",
+		AuthenticationProtocol: MD5,
+		AuthoritativeEngineID:  configuredEngineID,
+		SecretKey:              secretKey,
+		Logger:                 logger,
+	}
+
+	// Sign with an arbitrary key, then replace the MAC with one computed
+	// using an empty key.
+	trap := &SnmpPacket{
+		Version:       Version3,
+		MsgFlags:      AuthNoPriv,
+		SecurityModel: UserSecurityModel,
+		SecurityParameters: &UsmSecurityParameters{
+			UserName:               "myuser",
+			AuthenticationProtocol: MD5,
+			AuthoritativeEngineID:  "\x80\x00\x1f\x88\x04attacker",
+			SecretKey:              []byte("not the real key"),
+			Logger:                 logger,
+		},
+		PDUType:   SNMPv2Trap,
+		MsgID:     1,
+		RequestID: 1,
+		Variables: []SnmpPDU{{Name: trapTestOid, Type: OctetString, Value: trapTestPayload}},
+		Logger:    logger,
+	}
+	buf, err := trap.MarshalMsg()
+	require.NoError(t, err)
+	field := []byte("\x04\x06myuser\x04\x0c")
+	idx := bytes.Index(buf, field)
+	require.Positive(t, idx)
+	idx += len(field)
+	copy(buf[idx:], macVarbinds[MD5][2:])
+	forged, err := digestRFC3414(MD5, buf, []byte{})
+	require.NoError(t, err)
+	copy(buf[idx:], forged[:len(macVarbinds[MD5])-2])
+
+	res, err := gs.UnmarshalTrap(buf, true)
+	require.ErrorContains(t, err, "password is empty")
+	require.Nil(t, res)
+}
+
 func genericV3Trap() []byte {
 	return []byte{
 		0x30, 0x81, 0xd7, 0x02, 0x01, 0x03, 0x30, 0x11, 0x02, 0x04, 0x62, 0xaf,
@@ -556,7 +643,6 @@ func snmpV3AuthPrivTrap() []byte {
 
 func makeTestTrapHandler(done chan<- error, version SnmpVersion) func(*SnmpPacket, *net.UDPAddr) {
 	return func(packet *SnmpPacket, addr *net.UDPAddr) {
-		//log.Printf("got trapdata from %s\n", addr.IP)
 		done <- checkTestTrap(packet, version)
 	}
 }
@@ -584,7 +670,6 @@ func checkTestTrap(packet *SnmpPacket, version SnmpVersion) error {
 		switch v.Type {
 		case OctetString:
 			b := v.Value.([]byte)
-			// log.Printf("OID: %s, string: %x\n", v.Name, b)
 
 			// Only one OctetString in the payload, so it must be the expected one
 			if v.Name != trapTestOid {
@@ -594,7 +679,6 @@ func checkTestTrap(packet *SnmpPacket, version SnmpVersion) error {
 				return fmt.Errorf("incorrect trap payload received, expected %s got %x", trapTestPayload, b)
 			}
 		default:
-			// log.Printf("trap: %+v\n", v)
 		}
 	}
 	return nil
@@ -803,6 +887,60 @@ func TestListenV3DiscoveryRequestNotDelivered(t *testing.T) {
 			case p := <-received:
 				t.Fatalf("engine discovery request delivered to OnNewTrap: %v", p.PDUType)
 			case <-time.After(500 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestHandleTCPRequestFraming checks that the TCP trap listener reads one
+// trap by its BER length, however the stream splits or joins it.
+func TestHandleTCPRequestFraming(t *testing.T) {
+	marshalTrap := func(payload string) []byte {
+		pkt := newTestGoSNMP().mkSnmpPacket(SNMPv2Trap, []SnmpPDU{{Name: trapTestOid, Type: OctetString, Value: payload}}, 0, 0)
+		b, err := pkt.marshalMsg()
+		require.NoError(t, err)
+		return b
+	}
+	largePayload := strings.Repeat("x", 2000)
+	small, large := marshalTrap(trapTestPayload), marshalTrap(largePayload)
+
+	for _, tc := range []struct {
+		name   string
+		writes [][]byte
+		want   string // payload of the delivered trap, "" if none
+	}{
+		{"one write", [][]byte{small}, trapTestPayload},
+		{"split inside header", [][]byte{small[:1], small[1:20], small[20:]}, trapTestPayload},
+		{"long form split at MTU", [][]byte{large[:3], large[3:1448], large[1448:]}, largePayload},
+		{"followed by another trap", [][]byte{append(append([]byte{}, small...), large...)}, trapTestPayload},
+		{"length beyond buffer", [][]byte{{0x30, 0x82, 0x10, 0x00}}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan *SnmpPacket, 1)
+			tl := NewTrapListener()
+			tl.Params = newTestGoSNMP()
+			tl.OnNewTrap = func(p *SnmpPacket, _ *net.UDPAddr) { received <- p }
+
+			client, server := net.Pipe()
+			defer client.Close()
+			go func() {
+				for _, w := range tc.writes {
+					if _, err := client.Write(w); err != nil {
+						return
+					}
+				}
+			}()
+			tl.handleTCPRequest(server)
+
+			select {
+			case p := <-received:
+				require.NotEmpty(t, tc.want, "unexpected trap delivered")
+				require.Len(t, p.Variables, 1)
+				require.Equal(t, tc.want, string(p.Variables[0].Value.([]byte)))
+			default:
+				if tc.want != "" {
+					t.Fatal("trap was not delivered")
+				}
 			}
 		})
 	}
